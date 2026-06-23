@@ -7,6 +7,13 @@ use soroban_sdk::{
 
 const BPS_DENOMINATOR: i128 = 10_000;
 
+const BOOTSTRAP_DEFAULT_RULE: SettlementRule = SettlementRule {
+    platform_fee_bps: 100,
+    network_fee_bps: 0,
+    settlement_delay_ledger: 0,
+    auto_settle: false,
+};
+
 #[derive(Clone)]
 #[contracttype]
 pub struct SettlementRule {
@@ -46,6 +53,7 @@ enum DataKey {
     Admin,
     Merchant(Address),
     Rule(Address),
+    DefaultRule,
     Payment(BytesN<32>),
     Paused,
 }
@@ -148,12 +156,7 @@ impl SettlementContract {
         let prev = env.storage()
             .persistent()
             .get::<_, SettlementRule>(&DataKey::Rule(merchant.clone()))
-            .unwrap_or(SettlementRule {
-                platform_fee_bps: 100,
-                network_fee_bps: 0,
-                settlement_delay_ledger: 0,
-                auto_settle: false,
-            });
+            .unwrap_or_else(|| read_rule_or_default(&env, merchant.clone()));
 
         env.storage()
             .persistent()
@@ -190,6 +193,42 @@ impl SettlementContract {
             (Symbol::new(&env, "settlement_rule_cleared"), merchant),
             (admin, removed),
         );
+    }
+
+    /// ## Emitted Event: `default_rule_updated`
+    ///
+    /// **Topics**: `(Symbol("default_rule_updated"),)`
+    /// - First topic: fixed event-name symbol for filtering by event type
+    ///
+    /// **Data**: `(Address caller, SettlementRule previous, SettlementRule current)`
+    /// - `caller`: the admin who authorized the change
+    /// - `previous`: the previous global default rule (or bootstrap fallback if none was set)
+    /// - `current`: the new global default rule
+    pub fn set_default_rule(env: Env, new_rule: SettlementRule) {
+        let admin = read_admin(&env);
+        admin.require_auth();
+
+        if new_rule.platform_fee_bps > BPS_DENOMINATOR as u32 || new_rule.network_fee_bps > BPS_DENOMINATOR as u32 {
+            panic_with_error!(&env, SettlementError::InvalidFeeBps);
+        }
+
+        let prev = env.storage()
+            .persistent()
+            .get::<_, SettlementRule>(&DataKey::DefaultRule)
+            .unwrap_or(BOOTSTRAP_DEFAULT_RULE);
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::DefaultRule, &new_rule);
+
+        env.events().publish(
+            (Symbol::new(&env, "default_rule_updated"),),
+            (admin, prev, new_rule),
+        );
+    }
+
+    pub fn get_default_rule(env: Env) -> Option<SettlementRule> {
+        env.storage().persistent().get(&DataKey::DefaultRule)
     }
 
     pub fn store_payment_reference(env: Env, merchant: Address, reference: BytesN<32>, amount: i128) -> FeeSplit {
@@ -273,15 +312,16 @@ fn is_merchant_registered_internal(env: &Env, merchant: Address) -> bool {
 }
 
 fn read_rule_or_default(env: &Env, merchant: Address) -> SettlementRule {
-    env.storage()
-        .persistent()
-        .get(&DataKey::Rule(merchant))
-        .unwrap_or(SettlementRule {
-            platform_fee_bps: 100,
-            network_fee_bps: 0,
-            settlement_delay_ledger: 0,
-            auto_settle: false,
-        })
+    // 1. Merchant-specific rule (highest priority)
+    if let Some(rule) = env.storage().persistent().get::<_, SettlementRule>(&DataKey::Rule(merchant)) {
+        return rule;
+    }
+    // 2. Global default rule (configurable by admin)
+    if let Some(rule) = env.storage().persistent().get::<_, SettlementRule>(&DataKey::DefaultRule) {
+        return rule;
+    }
+    // 3. Bootstrap fallback (hardcoded)
+    BOOTSTRAP_DEFAULT_RULE
 }
 
 fn is_paused(env: &Env) -> bool {
@@ -609,5 +649,207 @@ mod tests {
         let (_env, client, _admin, merchant) = setup();
         client.register_merchant(&merchant);
         client.clear_settlement_rule(&merchant);
+    }
+
+    #[test]
+    fn bootstrap_default_used_before_any_default_rule_set() {
+        let (_env, client, _admin, merchant) = setup();
+        client.register_merchant(&merchant);
+        // No global default set — falls back to hardcoded 100 bps
+        let split = client.calculate_fee_split(&merchant, &50_000);
+        assert_eq!(split.platform_fee_amount, 500);
+        assert_eq!(split.network_fee_amount, 0);
+        assert_eq!(split.merchant_amount, 49_500);
+    }
+
+    #[test]
+    fn global_default_used_when_no_explicit_merchant_rule() {
+        let (_env, client, _admin, merchant) = setup();
+        client.register_merchant(&merchant);
+
+        let global_rule = SettlementRule {
+            platform_fee_bps: 200,
+            network_fee_bps: 50,
+            settlement_delay_ledger: 10,
+            auto_settle: true,
+        };
+        client.set_default_rule(&global_rule);
+
+        let split = client.calculate_fee_split(&merchant, &50_000);
+        assert_eq!(split.platform_fee_amount, 1_000);  // 200 bps
+        assert_eq!(split.network_fee_amount, 250);       // 50 bps
+        assert_eq!(split.merchant_amount, 48_750);
+    }
+
+    #[test]
+    fn explicit_merchant_rule_overrides_global_default() {
+        let (_env, client, _admin, merchant) = setup();
+        client.register_merchant(&merchant);
+
+        let global_rule = SettlementRule {
+            platform_fee_bps: 200,
+            network_fee_bps: 50,
+            settlement_delay_ledger: 10,
+            auto_settle: true,
+        };
+        client.set_default_rule(&global_rule);
+
+        let merchant_rule = SettlementRule {
+            platform_fee_bps: 175,
+            network_fee_bps: 25,
+            settlement_delay_ledger: 42,
+            auto_settle: false,
+        };
+        client.set_settlement_rule(&merchant, &merchant_rule);
+
+        let split = client.calculate_fee_split(&merchant, &50_000);
+        // Merchant rule (175/25) takes precedence over global default (200/50)
+        assert_eq!(split.platform_fee_amount, 875);  // 175 bps
+        assert_eq!(split.network_fee_amount, 125);     // 25 bps
+        assert_eq!(split.merchant_amount, 49_000);
+    }
+
+    #[test]
+    fn set_default_rule_stores_and_can_be_retrieved() {
+        let (_env, client, _admin, _merchant) = setup();
+
+        assert!(client.get_default_rule().is_none());
+
+        let rule = SettlementRule {
+            platform_fee_bps: 300,
+            network_fee_bps: 100,
+            settlement_delay_ledger: 5,
+            auto_settle: true,
+        };
+        client.set_default_rule(&rule);
+
+        let stored = client.get_default_rule().expect("global default must be present");
+        assert_eq!(stored.platform_fee_bps, 300);
+        assert_eq!(stored.network_fee_bps, 100);
+        assert_eq!(stored.settlement_delay_ledger, 5);
+        assert!(stored.auto_settle);
+    }
+
+    #[test]
+    fn set_default_rule_emits_event_with_correct_topic() {
+        let (env, client, _admin, _merchant) = setup();
+
+        let rule = SettlementRule {
+            platform_fee_bps: 150,
+            network_fee_bps: 25,
+            settlement_delay_ledger: 0,
+            auto_settle: false,
+        };
+        client.set_default_rule(&rule);
+
+        let events = env.events().all();
+        let (_contract_id, topics, _data) = events.get(events.len() - 1).unwrap();
+
+        // Single-element topic: just the event name
+        assert_eq!(topics.len(), 1);
+        assert_eq!(
+            Symbol::from_val(&env, &topics.get(0).unwrap()),
+            Symbol::new(&env, "default_rule_updated")
+        );
+    }
+
+    #[test]
+    fn set_default_rule_updates_twice_emits_correct_previous() {
+        let (_env, client, _admin, _merchant) = setup();
+
+        let first = SettlementRule {
+            platform_fee_bps: 200,
+            network_fee_bps: 50,
+            settlement_delay_ledger: 10,
+            auto_settle: true,
+        };
+        client.set_default_rule(&first);
+        let stored = client.get_default_rule().expect("global default must be present");
+        assert_eq!(stored.platform_fee_bps, 200);
+
+        let second = SettlementRule {
+            platform_fee_bps: 500,
+            network_fee_bps: 100,
+            settlement_delay_ledger: 20,
+            auto_settle: false,
+        };
+        client.set_default_rule(&second);
+        let stored = client.get_default_rule().expect("global default must be present");
+        assert_eq!(stored.platform_fee_bps, 500);
+    }
+
+    #[test]
+    fn clearing_rule_falls_back_to_global_default() {
+        let (_env, client, _admin, merchant) = setup();
+        client.register_merchant(&merchant);
+
+        let global_rule = SettlementRule {
+            platform_fee_bps: 200,
+            network_fee_bps: 50,
+            settlement_delay_ledger: 10,
+            auto_settle: true,
+        };
+        client.set_default_rule(&global_rule);
+
+        let merchant_rule = SettlementRule {
+            platform_fee_bps: 500,
+            network_fee_bps: 100,
+            settlement_delay_ledger: 20,
+            auto_settle: false,
+        };
+        client.set_settlement_rule(&merchant, &merchant_rule);
+        client.clear_settlement_rule(&merchant);
+
+        // After clearing, should fall back to global default (200/50), not bootstrap (100/0)
+        let split = client.calculate_fee_split(&merchant, &50_000);
+        assert_eq!(split.platform_fee_amount, 1_000);  // 200 bps
+        assert_eq!(split.network_fee_amount, 250);       // 50 bps
+        assert_eq!(split.merchant_amount, 48_750);
+    }
+
+    #[test]
+    #[should_panic]
+    fn set_default_rule_fails_for_non_admin() {
+        let env = Env::default();
+        let admin = Address::generate(&env);
+        let contract_id: Address = env.register_contract(None, SettlementContract);
+        let client = SettlementContractClient::new(&env, &contract_id);
+
+        let invoke = MockAuthInvoke {
+            contract: &contract_id,
+            fn_name: "init",
+            args: soroban_sdk::vec![&env, admin.to_val()],
+            sub_invokes: &[],
+        };
+        let auth = MockAuth {
+            address: &admin,
+            invoke: &invoke,
+        };
+        env.set_auths(&[(&auth).into()]);
+        client.init(&admin);
+
+        let rule = SettlementRule {
+            platform_fee_bps: 200,
+            network_fee_bps: 50,
+            settlement_delay_ledger: 10,
+            auto_settle: true,
+        };
+
+        // Do NOT authorize admin — should panic
+        client.set_default_rule(&rule);
+    }
+
+    #[test]
+    #[should_panic]
+    fn set_default_rule_rejects_invalid_fee_bps() {
+        let (_env, client, _admin, _merchant) = setup();
+
+        let bad_rule = SettlementRule {
+            platform_fee_bps: 10_001,
+            network_fee_bps: 0,
+            settlement_delay_ledger: 0,
+            auto_settle: false,
+        };
+        client.set_default_rule(&bad_rule);
     }
 }
