@@ -103,7 +103,7 @@ impl GovernanceContract {
         let admin = read_admin(&env);
         admin.require_auth();
         env.storage().instance().set(&DataKey::Paused, &true);
-        env.events().publish((symbol_short!("pause"),), true);
+        env.events().publish((symbol_short!("pause"),), (admin, true));
     }
 
     pub fn unpause(env: Env) {
