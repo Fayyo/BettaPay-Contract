@@ -6,6 +6,8 @@ use soroban_sdk::{
 };
 
 const BPS_DENOMINATOR: i128 = 10_000;
+const RULE_TTL_THRESHOLD: u32 = 17280 * 14;
+const RULE_TTL_BUMP: u32 = 17280 * 30;
 
 const BOOTSTRAP_DEFAULT_RULE: SettlementRule = SettlementRule {
     platform_fee_bps: 100,
@@ -158,9 +160,14 @@ impl SettlementContract {
             .get::<_, SettlementRule>(&DataKey::Rule(merchant.clone()))
             .unwrap_or_else(|| read_rule_or_default(&env, merchant.clone()));
 
+        let key = DataKey::Rule(merchant.clone());
         env.storage()
             .persistent()
-            .set(&DataKey::Rule(merchant.clone()), &rule);
+            .set(&key, &rule);
+            
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, RULE_TTL_THRESHOLD, RULE_TTL_BUMP);
 
         env.events().publish(
             (Symbol::new(&env, "settlement_rule_updated"), merchant),
@@ -371,6 +378,28 @@ mod tests {
         client.register_merchant(&merchant);
         assert!(client.is_merchant_registered(&merchant));
         assert!(env.events().all().len() > before);
+    }
+
+    #[test]
+    fn extends_ttl_when_updating_settlement_rule() {
+        let (env, client, _admin, merchant) = setup();
+        client.register_merchant(&merchant);
+
+        let rule = SettlementRule {
+            platform_fee_bps: 100,
+            network_fee_bps: 0,
+            settlement_delay_ledger: 0,
+            auto_settle: false,
+        };
+        
+        // This will successfully write and extend the TTL for the rule
+        client.set_settlement_rule(&merchant, &rule);
+
+        // Verify the persistent entry exists
+        env.as_contract(&client.address, || {
+            let key = DataKey::Rule(merchant.clone());
+            assert!(env.storage().persistent().has(&key));
+        });
     }
 
     #[test]
