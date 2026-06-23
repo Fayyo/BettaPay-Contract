@@ -6,8 +6,11 @@ use soroban_sdk::{
 };
 
 const BPS_DENOMINATOR: i128 = 10_000;
+const MIN_PAYMENT_AMOUNT: i128 = 100;
 const RULE_TTL_THRESHOLD: u32 = 17280 * 14;
 const RULE_TTL_BUMP: u32 = 17280 * 30;
+const PAYMENT_TTL_THRESHOLD: u32 = 17280 * 14;
+const PAYMENT_TTL_BUMP: u32 = 17280 * 30;
 
 const BOOTSTRAP_DEFAULT_RULE: SettlementRule = SettlementRule {
     platform_fee_bps: 100,
@@ -122,8 +125,11 @@ impl SettlementContract {
     pub fn register_merchant(env: Env, merchant: Address) {
         assert_not_paused(&env);
 
-        let zero_address_str = soroban_sdk::String::from_str(&env, "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF");
-        if merchant.to_string().len() == 0 || merchant.to_string() == zero_address_str {
+        let zero_address_str = soroban_sdk::String::from_str(
+            &env,
+            "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+        );
+        if merchant.to_string().is_empty() || merchant.to_string() == zero_address_str {
             panic_with_error!(&env, SettlementError::InvalidAddress);
         }
 
@@ -171,10 +177,8 @@ impl SettlementContract {
             .unwrap_or_else(|| read_rule_or_default(&env, merchant.clone()));
 
         let key = DataKey::Rule(merchant.clone());
-        env.storage()
-            .persistent()
-            .set(&key, &rule);
-            
+        env.storage().persistent().set(&key, &rule);
+
         env.storage()
             .persistent()
             .extend_ttl(&key, RULE_TTL_THRESHOLD, RULE_TTL_BUMP);
@@ -348,10 +352,7 @@ fn is_merchant_registered_internal(env: &Env, merchant: Address) -> bool {
     if env.storage().persistent().has(&key) {
         env.storage().persistent().extend_ttl(&key, 50_000, 100_000);
     }
-    env.storage()
-        .persistent()
-        .get(&key)
-        .unwrap_or(false)
+    env.storage().persistent().get(&key).unwrap_or(false)
 }
 
 fn read_rule_or_default(env: &Env, merchant: Address) -> SettlementRule {
@@ -431,8 +432,14 @@ mod tests {
     #[should_panic]
     fn rejects_invalid_merchant_address() {
         let (env, client, _admin, _merchant) = setup();
-        let zero_address = Address::from_string(&soroban_sdk::String::from_str(&env, "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF"));
+        let zero_address = Address::from_string(&soroban_sdk::String::from_str(
+            &env,
+            "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+        ));
         client.register_merchant(&zero_address);
+    }
+
+    #[test]
     fn extends_ttl_when_updating_settlement_rule() {
         let (env, client, _admin, merchant) = setup();
         client.register_merchant(&merchant);
@@ -443,7 +450,7 @@ mod tests {
             settlement_delay_ledger: 0,
             auto_settle: false,
         };
-        
+
         // This will successfully write and extend the TTL for the rule
         client.set_settlement_rule(&merchant, &rule);
 
@@ -650,8 +657,10 @@ mod tests {
         client.register_merchant(&merchant);
         let reference = BytesN::from_array(&env, &[100; 32]);
         client.store_payment_reference(&merchant, &reference, &100);
-        
-        let stored = client.get_payment_reference(&reference).expect("expected payment record");
+
+        let stored = client
+            .get_payment_reference(&reference)
+            .expect("expected payment record");
         assert_eq!(stored.amount, 100);
     }
 
