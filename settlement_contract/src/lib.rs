@@ -411,8 +411,10 @@ fn assert_not_paused(env: &Env) {
 }
 
 fn calculate_split(amount: i128, rule: &SettlementRule) -> FeeSplit {
-    let platform_fee_amount = amount * (rule.platform_fee_bps as i128) / BPS_DENOMINATOR;
-    let network_fee_amount = amount * (rule.network_fee_bps as i128) / BPS_DENOMINATOR;
+    let platform_fee_amount =
+        (amount * (rule.platform_fee_bps as i128) + BPS_DENOMINATOR - 1) / BPS_DENOMINATOR;
+    let network_fee_amount =
+        (amount * (rule.network_fee_bps as i128) + BPS_DENOMINATOR - 1) / BPS_DENOMINATOR;
     let merchant_amount = amount - platform_fee_amount - network_fee_amount;
     FeeSplit {
         gross_amount: amount,
@@ -594,6 +596,22 @@ mod tests {
         assert_eq!(stored.network_fee_bps, 50);
         assert_eq!(stored.amount, 20_000);
         assert!(env.events().all().len() >= before + 2);
+    }
+
+    #[test]
+    fn rounds_fee_split_up_for_small_amounts() {
+        let rule = SettlementRule {
+            platform_fee_bps: 1,
+            network_fee_bps: 1,
+            settlement_delay_ledger: 0,
+            auto_settle: false,
+        };
+
+        let split = calculate_split(100, &rule);
+
+        assert_eq!(split.platform_fee_amount, 1);
+        assert_eq!(split.network_fee_amount, 1);
+        assert_eq!(split.merchant_amount, 98);
     }
 
     #[test]
